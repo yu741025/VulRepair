@@ -20,7 +20,8 @@ import logging
 import os
 import random
 import numpy as np
-import torch
+import torch, gc
+
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup, 
                           T5ForConditionalGeneration, RobertaTokenizer)
@@ -29,10 +30,16 @@ import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 import datasets
 from sklearn.model_selection import train_test_split
-
-
 cpu_cont = 16
 logger = logging.getLogger(__name__)
+
+'''
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--local_rank", type=int)
+args = parser.parse_args()
+torch.cuda.set_device(args.local_rank)'''
+
 
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -116,7 +123,11 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
     
     # multi-gpu training
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model,device_ids = [0, 1])
+        if isinstance(model, torch.nn.DataParallel):
+            model_attr_accessor = model.module
+        else:
+            model_attr_accessor = model
 
     # Train!
     logger.info("***** Running training *****")
@@ -198,7 +209,11 @@ def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=0)
     # multi-gpu evaluate
     if args.n_gpu > 1 and eval_when_training is False:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model,device_ids = [0, 1])
+        if isinstance(model, torch.nn.DataParallel):
+            model_attr_accessor = model.module
+        else:
+            model_attr_accessor = model
     # Eval!
     logger.info("***** Running evaluation *****")
     logger.info("  Num examples = %d", len(eval_dataset))
@@ -226,50 +241,59 @@ def test(args, model, tokenizer, test_dataset, best_threshold=0.5):
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=0)
     # multi-gpu evaluate
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model,device_ids = [0, 1])
+        if isinstance(model, torch.nn.DataParallel):
+            model_attr_accessor = model.module
+        else:
+            model_attr_accessor = model
     # Test!
     logger.info("***** Running Test *****")
     logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
     nb_eval_steps = 0
+
     model.eval()
     accuracy = []
     raw_predictions = []
     correct_prediction = ""
     bar = tqdm(test_dataloader, total=len(test_dataloader))
-    for batch in bar:
-        correct_pred = False
-        (input_ids, attention_mask, labels, decoder_input_ids)=[x.squeeze(1).to(args.device) for x in batch]
-        with torch.no_grad():
-            beam_outputs = model.generate(input_ids=input_ids,
-                                          attention_mask=attention_mask,
-                                          do_sample=False, # disable sampling to test if batching affects output
-                                          num_beams=args.num_beams,
-                                          num_return_sequences=args.num_beams,
-                                          max_length=args.decoder_block_size)
-        beam_outputs = beam_outputs.detach().cpu().tolist()
-        decoder_input_ids = decoder_input_ids.detach().cpu().tolist()
-        for single_output in beam_outputs:
-            # pred
-            prediction = tokenizer.decode(single_output, skip_special_tokens=False)
-            prediction = clean_tokens(prediction)
-            # truth
-            ground_truth = tokenizer.decode(decoder_input_ids[0], skip_special_tokens=False)
-            ground_truth = clean_tokens(ground_truth)
-            if prediction == ground_truth:
-                correct_prediction = prediction
-                correct_pred = True
-                break
-        if correct_pred:
-            raw_predictions.append(correct_prediction)
-            accuracy.append(1)
-        else:
-            # if not correct, use the first output in the beam as the raw prediction
-            raw_pred = tokenizer.decode(beam_outputs[0], skip_special_tokens=False)
-            raw_pred = clean_tokens(raw_pred)
-            raw_predictions.append(raw_pred)
-            accuracy.append(0)
-        nb_eval_steps += 1
+    with torch.no_grad():
+        gc.collect()
+        for batch in bar:
+            correct_pred = False
+            (input_ids, attention_mask, labels, decoder_input_ids)=[x.squeeze(1).to(args.device) for x in batch]
+            with torch.no_grad():
+                beam_outputs = model.module.generate(input_ids=input_ids,
+                                            attention_mask=attention_mask,
+                                            do_sample=False, # disable sampling to test if batching affects output
+                                            num_beams=args.num_beams,
+                                            num_return_sequences=args.num_beams,
+                                            max_length=args.decoder_block_size)
+            beam_outputs = beam_outputs.detach().cpu().tolist()
+            decoder_input_ids = decoder_input_ids.detach().cpu().tolist()
+            for single_output in beam_outputs:
+                # pred
+                prediction = tokenizer.decode(single_output, skip_special_tokens=False)
+                prediction = clean_tokens(prediction)
+                # truth
+                ground_truth = tokenizer.decode(decoder_input_ids[0], skip_special_tokens=False)
+                ground_truth = clean_tokens(ground_truth)
+                if prediction == ground_truth:
+                    correct_prediction = prediction
+                    correct_pred = True
+                    break
+            if correct_pred:
+                raw_predictions.append(correct_prediction)
+                accuracy.append(1)
+            else:
+                # if not correct, use the first output in the beam as the raw prediction
+                raw_pred = tokenizer.decode(beam_outputs[0], skip_special_tokens=False)
+                raw_pred = clean_tokens(raw_pred)
+                raw_predictions.append(raw_pred)
+                accuracy.append(0)
+            nb_eval_steps += 1
+            gc.collect()
+            torch.cuda.empty_cache()
     # calculate accuracy
     test_result = round(sum(accuracy) / len(accuracy), 4)
     logger.info("***** Test results *****")
@@ -279,7 +303,7 @@ def test(args, model, tokenizer, test_dataset, best_threshold=0.5):
     df = pd.DataFrame({"raw_predictions": [], "correctly_predicted": []})
     df["raw_predictions"] = raw_predictions
     df["correctly_predicted"] = accuracy
-    df.to_csv("./raw_predictions/VulRepair_raw_preds.csv")
+    df.to_csv("./vulrepair_raw_predictions/VulRepair_raw_preds.csv")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -342,8 +366,8 @@ def main():
     args = parser.parse_args()
 
     # Setup CUDA, GPU
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    args.n_gpu = 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.n_gpu = 2
     args.device = device
 
     # Setup logging
